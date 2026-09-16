@@ -1,0 +1,36 @@
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Runs the exact same hooks as your local pre-commit, so CI and the
+  # developer machine can never enforce different rules.
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: pip install pre-commit
+      - run: pre-commit run --all-files --show-diff-on-failure
+
+  # Scans the FULL git history, not just the current tree. This is the part
+  # pre-commit cannot do: a secret committed and later deleted is still in
+  # the history of a repo that is about to be public.
+  gitleaks-history:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
