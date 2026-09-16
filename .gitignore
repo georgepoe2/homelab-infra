@@ -1,0 +1,45 @@
+# --- OpenTofu / Terraform ---
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+.terraform/
+.terraformrc
+terraform.rc
+
+# Deny tfvars by default; re-include the ones reviewed as publishable.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+!nodes.auto.tfvars
+
+# NOTE: .terraform.lock.hcl is deliberately NOT ignored — commit it.
+
+# --- Secrets and credentials ---
+*.agekey
+age.key
+key.txt
+*.pem
+*.key
+*_rsa
+*_ed25519
+.env
+.env.*
+!.env.example
+s3.json
+kubeconfig
+*.kubeconfig
+.kube/
+
+# --- Decrypted SOPS output ---
+*.dec.yaml
+*.dec.yml
+*.decrypted.*
+
+# --- Editors and OS ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
