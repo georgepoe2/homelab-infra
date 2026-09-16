@@ -1,10 +1,17 @@
 name: checks
 
+# Every push on every branch. A secret pushed to a side branch is already on
+# GitHub's servers and in the object store — deleting the branch does not
+# unpublish it, so there is no branch worth leaving unscanned.
 on:
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
+
+# Supersede in-flight runs for the same ref rather than queueing them.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
