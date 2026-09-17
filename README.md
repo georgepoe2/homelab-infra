@@ -21,7 +21,7 @@ Built in phases. This is honest about where it is.
 | 2 — DNS, naming, internal CA | ✅ Complete |
 | 3 — Rocky 9 golden image | ✅ Complete |
 | 4 — State store, repos, secrets | ✅ Complete |
-| 5 — Provisioning with OpenTofu | 🚧 In progress |
+| 5 — Provisioning with OpenTofu | ✅ Complete |
 | 6 — RKE2 cluster | ⬜ Not started |
 | 7 — Flux and the platform layer | ⬜ Not started |
 | 8 — Operate: restore, rebuild, upgrade | ⬜ Not started |
@@ -218,6 +218,96 @@ The guard was fine; the test was wrong. Re-tested with a private-key header,
 which both `gitleaks` and `detect-private-key` caught. **An untested guard is
 a decoration, and a test that cannot fail tests nothing.**
 
+### macOS refused the connection and called it a routing failure
+
+`tofu apply` failed repeatedly with `dial tcp 192.168.1.215:8006: connect: no
+route to host`. Nothing was wrong with the network. A `ping` running
+*concurrently with the failing apply* held 0% loss over 26 packets, `curl` to
+the same host and port had returned 200 seconds earlier, Wi-Fi was off, there
+was a single ARP entry, and the Proxmox NIC showed zero errors across 52
+million packets.
+
+macOS Local Network privacy returns `EHOSTUNREACH` when it blocks a connection
+to an RFC 1918 address — no prompt, no log entry, and an error indistinguishable
+from a real routing failure. The permission subject is the *running process*, so
+the grant that already existed in System Settings did nothing until Terminal was
+fully quit and relaunched.
+
+**ICMP is not gated by it, so a clean ping does not exonerate the network — it
+points at this.** That inversion is what cost the most time.
+
+### The golden image carried a resolver nobody configured
+
+Proxmox passed each VM exactly one nameserver. Inside them, `/etc/resolv.conf`
+listed two, with the gateway first:
+
+```
+nameserver 192.168.1.1     # never configured anywhere
+nameserver 192.168.1.250   # the one Phase 2 set up
+```
+
+`qm config` showed only `.250`, and NetworkManager was running with `dns=none
+rc-manager=unmanaged`, so it was not writing the file at all. Two behaviours
+combined: the Packer build ran on DHCP, so NetworkManager wrote the gateway into
+`/etc/resolv.conf` and that file was baked into the template; and cloud-init's
+RHEL path *updates* `/etc/resolv.conf` in place, adding servers that are missing
+and removing nothing.
+
+The ordering mattered because the gateway answers only for hosts in its own DHCP
+lease table and returns NODATA for everything else — including
+`nas.rookery.internal`. glibc treats NODATA as authoritative, so resolution of
+the NAS was *intermittent*: identical lookups minutes apart returned an answer
+once and nothing the next time. That name is the S3 endpoint RKE2 uses for etcd
+snapshots.
+
+Fixed with `truncate -s 0 /etc/resolv.conf` in the template generalization
+step — alongside the machine-id and SSH host key removal — and a `sed` across
+the eight existing VMs. **A resolver that works most of the time is worse
+than one that never works — it fails later, under load, disguised as something
+else.**
+
+### Provider defaults overwrote what the template already had
+
+The first plan contained `+ bios = "seabios"` and `+ scsi_hardware =
+"virtio-scsi-pci"` — attributes never written in the config. Template 9002 is
+OVMF on q35, so `seabios` would have produced eight VMs that never booted, and
+the cause would have looked like a broken template rather than a provider
+default.
+
+**In a plan, a `+` on an attribute you never wrote is not noise. It is the
+provider telling you what it is about to decide on your behalf.**
+
+### Shared storage does not make a template node-independent
+
+Five of eight clones failed with `unable to find configuration file for VM 9002
+on node 'pve-3'`. A VM's config lives at
+`/etc/pve/nodes/<node>/qemu-server/9002.conf` and belongs to exactly one node.
+Shared storage holds the template's *disks*; it does not move the *config*. The
+clone must be initiated on the owning node with the other as target — `node_name`
+inside the `clone` block is the source, the resource's own `node_name` is the
+destination.
+
+The clones that did target the right node failed differently: `cfs-lock
+'storage-pve-nfs' error: got lock request timeout`. OpenTofu's default
+parallelism is 10, and Proxmox serializes storage operations behind a
+cluster-wide lock, so seven concurrent full clones exhausted it. Fixed with
+`-parallelism=2` and `retries = 3` in the clone block.
+
+**Both errors say "lock" and neither involved the state lock.** Identifying
+which layer an error came from was most of the diagnosis.
+
+### `prevent_destroy` paid for itself
+
+Adding `node_name` to the `clone` block turned the next plan into **8 to add, 3
+to destroy**. The provider treats `clone` as part of the resource's identity, so
+changing it forces replacement — of three VMs that were already built correctly,
+in order to alter a field describing an event that had already happened.
+
+`prevent_destroy` refused the plan instead of executing it. The fix was
+`ignore_changes = [clone]`, since a clone is creation-time only and drift on it
+is meaningless.
+
+**A guard rail that has never fired is not evidence that it was unnecessary.**
 ---
 
 ## Repository layout
@@ -252,7 +342,6 @@ it rather than assumed to work.
 
 ## Roadmap
 
-- Phase 5 — eight VMs from one `for_each` resource, encrypted remote state
 - Phase 6 — RKE2 with kube-vip, CNI chosen deliberately
 - Phase 7 — Flux, MetalLB, ingress-nginx, cert-manager, NFS CSI
 - Phase 8 — restore an etcd snapshot, destroy and rebuild the whole cluster
