@@ -1,0 +1,48 @@
+---
+# ---- Versions ----------------------------------------------------------
+# Deliberately one minor behind the newest release: 1.37.0 was four days old
+# at install time, and Phase 8's upgrade drill is only meaningful if there is
+# a real minor version to upgrade to. Ships Cilium v1.19.6.
+rke2_version: "v1.36.4+rke2r1"
+
+# Deployed as a DaemonSet rather than a static pod: kube-vip#909 documents the
+# static pod racing the API server on RKE2 node reboot, exiting, and not being
+# restarted - which would invalidate the control-plane failure drill in 6.4.
+kube_vip_version: "v1.2.4"
+
+# ---- Cluster identity (permanent after first boot) ---------------------
+rke2_bootstrap_host: "k8s-cp-1"
+rke2_vip: "192.168.1.201"
+rke2_vip_hostname: "k8s.rookery.internal"
+rke2_vip_interface: "eth0"
+
+rke2_cluster_cidr: "10.42.0.0/16"
+rke2_service_cidr: "10.43.0.0/16"
+
+# Every name or address a client may use to reach the API server. Missing
+# entries here cannot be added later without regenerating certificates.
+rke2_tls_san:
+  - "192.168.1.201"
+  - "k8s.rookery.internal"
+  - "192.168.1.221"
+  - "192.168.1.222"
+  - "192.168.1.223"
+  - "k8s-cp-1.rookery.internal"
+  - "k8s-cp-2.rookery.internal"
+  - "k8s-cp-3.rookery.internal"
+
+# ---- Posture -----------------------------------------------------------
+# CIS benchmark hardening. Requires the etcd user and the CIS sysctls on each
+# node before the service starts; both are handled in rke2-server.yml.
+rke2_profile: "cis"
+
+# Three control planes and four workers, so keep workloads off the control
+# plane. RKE2's documented taint for this.
+rke2_taint_control_plane: true
+
+# ---- etcd snapshots to SeaweedFS on the NAS ----------------------------
+rke2_etcd_s3_endpoint: "nas.rookery.internal:8333"   # host:port, no scheme
+rke2_etcd_s3_bucket: "etcd-snapshots"
+rke2_etcd_s3_region: "us-east-1"
+rke2_etcd_snapshot_cron: "0 */6 * * *"
+rke2_etcd_snapshot_retention: 20

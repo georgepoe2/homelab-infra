@@ -22,7 +22,7 @@ Built in phases. This is honest about where it is.
 | 3 — Rocky 9 golden image | ✅ Complete |
 | 4 — State store, repos, secrets | ✅ Complete |
 | 5 — Provisioning with OpenTofu | ✅ Complete |
-| 6 — RKE2 cluster | ⬜ Not started |
+| 6 — RKE2 cluster | 🚧 Cluster up; HA drill outstanding |
 | 7 — Flux and the platform layer | ⬜ Not started |
 | 8 — Operate: restore, rebuild, upgrade | ⬜ Not started |
 
@@ -308,6 +308,68 @@ in order to alter a field describing an event that had already happened.
 is meaningless.
 
 **A guard rail that has never fired is not evidence that it was unnecessary.**
+### Two hypervisors lost their NICs four minutes apart, and the cluster did not notice
+
+Installing RKE2 on all four workers at once put two simultaneous multi-GB image
+pulls through pve-1's single 1 GbE link and one through pve-2's. Both hosts
+stopped transmitting:
+
+```
+e1000e 0000:80:1f.6 nic0: Detected Hardware Unit Hang
+```
+
+The hosts stayed alive — load average 0.27, no OOM, the power button still
+worked. They simply could not transmit, so every VM on them went dark,
+`pve-nfs` went "not online", and corosync dropped them.
+
+The corosync log on the surviving node dates it precisely. pve-1's link
+recovered at 14:35:52 and wedged again 26 seconds later, which is the driver
+resetting the adapter and the same load immediately re-wedging it. pve-2
+followed at 14:39:07. **The failure order matches the load order exactly:** two
+workers installing on pve-1, one on pve-2, one on pve-3, which survived.
+
+All three hosts run the same `e1000e` NIC, so pve-3 was lucky rather than
+different. Mitigated with a systemd unit disabling offloads on each host, and
+by serialising the Ansible play so only one image pull per host runs at a time.
+The `serial: 1` on `rke2-agent.yml` is a **hypervisor** constraint, not a
+cluster one — agents joining an established cluster contend for nothing.
+
+What this bought: an unplanned and unannounced version of the Phase 8 control
+plane failure drill. Two of three hypervisors dropped out within four minutes,
+taking one control plane and two workers with them, and **etcd held quorum, the
+kube-vip VIP failed over, and the surviving nodes kept serving.** After the
+hosts came back, `etcdctl endpoint health --cluster` reported all three members
+healthy with no intervention.
+
+The latent fault was always going to surface during Phase 8's rebuild, when
+eight VMs are destroyed and recreated and all of them pull images at once —
+mid-drill, with no baseline for what "working" looks like.
+
+### RKE2 1.36 ships Traefik, not ingress-nginx
+
+The runbook said to disable `rke2-ingress-nginx` so Flux could own the ingress
+controller. That component does not exist in this version. Listing
+`/var/lib/rancher/rke2/server/manifests` during unrelated debugging showed
+`rke2-traefik.yaml` — so the config had been disabling something absent while
+leaving the real controller in place, and would have applied cleanly, reported
+success, and produced two controllers fighting over ingress in Phase 7.
+
+**Configuration that succeeds at doing nothing is the recurring theme of this
+build** — alongside `use_lockfile` failing open and
+`etcd-s3-bucket-lookup-type: auto` silently uploading nothing.
+
+### The nodes preferred an address family they could not route
+
+`curl` and `dnf` intermittently failed with `No route to host` reaching
+`rpm.rancher.io`. Both A and AAAA records resolve; the VMs have no global IPv6
+address. glibc's built-in RFC 3484 table ranks native IPv6 above IPv4-mapped,
+so `getaddrinfo` handed out an unreachable address — sometimes. The control
+planes drew IPv4 and installed fine; a worker drew IPv6 and failed.
+
+A non-deterministic failure that a retry appears to fix is worse than a
+consistent one. Fixed at the source with `precedence ::ffff:0:0/96 100` in
+`/etc/gai.conf`, which applies to every program on the node, rather than adding
+`--ipv4` to each caller as it fails.
 ---
 
 ## Repository layout
@@ -342,7 +404,7 @@ it rather than assumed to work.
 
 ## Roadmap
 
-- Phase 6 — RKE2 with kube-vip, CNI chosen deliberately
+- Phase 6 — HA failure drill (cluster itself is up; see [ADR-002](docs/adr/002-cilium-as-cni.md))
 - Phase 7 — Flux, MetalLB, ingress-nginx, cert-manager, NFS CSI
 - Phase 8 — restore an etcd snapshot, destroy and rebuild the whole cluster
   twice, drive a minor-version upgrade with zero dropped requests

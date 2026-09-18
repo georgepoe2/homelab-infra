@@ -1,0 +1,160 @@
+---
+# Install and start RKE2 server nodes.
+#
+# serial: 1 because the bootstrap node must be fully up before any other
+# server tries to join it. Run the bootstrap node alone first:
+#     ansible-playbook rke2-server.yml --limit k8s-cp-1
+# then bring up kube-vip, then the remaining two.
+- name: RKE2 control plane
+  hosts: rke2_servers
+  become: true
+  serial: 1
+  gather_facts: true
+
+  tasks:
+
+    # RKE2 names the node after `hostname`, which cloud-init set to the FQDN.
+    # The inventory's short name will never match it.
+    - name: Determine the Kubernetes node name
+      ansible.builtin.set_fact:
+        rke2_node_name: "{{ ansible_fqdn }}"
+
+    - name: Required secrets are present
+      ansible.builtin.assert:
+        that:
+          - rke2_token is defined and rke2_token | length >= 32
+          - rke2_etcd_s3_access_key is defined
+          - rke2_etcd_s3_secret_key is defined
+        fail_msg: >
+          Secrets not loaded. Check SOPS_AGE_KEY_FILE is exported and that
+          community.sops is installed (ansible-galaxy install -r requirements.yml).
+        quiet: true
+
+    # ---- CIS prerequisites, before the service ever starts ----
+
+    - name: etcd system user and group exist
+      ansible.builtin.user:
+        name: etcd
+        system: true
+        shell: /sbin/nologin
+        create_home: false
+        comment: "etcd user"
+
+    # ---- Install ----
+
+    - name: RKE2 is installed at the pinned version
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          curl -sfL --ipv4 https://get.rke2.io | INSTALL_RKE2_VERSION="{{ rke2_version }}" sh -
+        executable: /bin/bash
+      args:
+        creates: /usr/local/lib/systemd/system/rke2-server.service
+
+    - name: Report the installed version
+      ansible.builtin.command:
+        cmd: /var/lib/rancher/rke2/bin/kubectl version --client=true -o yaml
+      register: rke2_installed
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    # ---- CIS sysctls (the file only exists once RKE2 is installed) ----
+
+    - name: CIS sysctl profile is in place
+      ansible.builtin.copy:
+        src: /usr/share/rke2/rke2-cis-sysctl.conf
+        dest: /etc/sysctl.d/60-rke2-cis.conf
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload sysctl
+
+    - name: Apply sysctls now, before the service starts
+      ansible.builtin.meta: flush_handlers
+
+    # ---- Configuration ----
+
+    - name: Configuration directory exists
+      ansible.builtin.file:
+        path: /etc/rancher/rke2
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: config.yaml is rendered
+      ansible.builtin.template:
+        src: config.yaml.j2
+        dest: /etc/rancher/rke2/config.yaml
+        owner: root
+        group: root
+        mode: "0600"
+      notify: Restart rke2-server
+
+    - name: Manifests directory exists
+      ansible.builtin.file:
+        path: /var/lib/rancher/rke2/server/manifests
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Cilium HelmChartConfig is in place before first start
+      ansible.builtin.template:
+        src: rke2-cilium-config.yaml.j2
+        dest: /var/lib/rancher/rke2/server/manifests/rke2-cilium-config.yaml
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: kube-vip DaemonSet is in place
+      ansible.builtin.template:
+        src: kube-vip.yaml.j2
+        dest: /var/lib/rancher/rke2/server/manifests/kube-vip.yaml
+        owner: root
+        group: root
+        mode: "0600"
+
+    # ---- Start ----
+
+    - name: rke2-server is enabled and running
+      ansible.builtin.systemd:
+        name: rke2-server
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Wait for the kubeconfig to be written
+      ansible.builtin.wait_for:
+        path: /etc/rancher/rke2/rke2.yaml
+        timeout: 600
+
+    - name: Wait for this node to report Ready
+      # Single-quoted so shlex keeps the inner double quotes; without them the
+      # jsonpath filter becomes @.type==Ready, which matches nothing and the
+      # task retries forever against a healthy node.
+      ansible.builtin.command:
+        cmd: >
+          /var/lib/rancher/rke2/bin/kubectl
+          --kubeconfig /etc/rancher/rke2/rke2.yaml
+          get node {{ rke2_node_name }}
+          -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: node_ready
+      until: node_ready.stdout == "True"
+      retries: 60
+      delay: 10
+      changed_when: false
+      check_mode: false
+
+  handlers:
+    - name: Reload sysctl
+      ansible.builtin.systemd:
+        name: systemd-sysctl
+        state: restarted
+
+    - name: Restart rke2-server
+      ansible.builtin.systemd:
+        name: rke2-server
+        state: restarted

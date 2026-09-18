@@ -66,3 +66,9 @@ variable "state_passphrase" {
   sensitive   = true
   # No default. Unset should be an error, not a weak key.
 }
+
+variable "ssh_private_key_path" {
+  description = "Private key Ansible uses to reach the nodes. Written into the generated inventory."
+  type        = string
+  default     = "~/.ssh/id_ed25519"
+}

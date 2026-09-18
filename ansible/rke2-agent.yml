@@ -1,0 +1,101 @@
+---
+# Join the worker nodes.
+#
+# serial: 1 is NOT about cluster contention - agents joining an established
+# cluster do not contend. It is about the hypervisors. Installing all four at
+# once put two simultaneous multi-GB image pulls through pve-1's single 1GbE
+# e1000e NIC and one through pve-2's; both NICs hit a TX hardware unit hang
+# within four minutes of each other and took every VM on those hosts offline.
+# One node at a time keeps the sustained throughput per host to one stream.
+- name: RKE2 agents
+  hosts: rke2_agents
+  become: true
+  serial: 1
+  gather_facts: true
+
+  tasks:
+
+    - name: Determine the Kubernetes node name
+      ansible.builtin.set_fact:
+        rke2_node_name: "{{ ansible_fqdn }}"
+
+    - name: Required secrets are present
+      ansible.builtin.assert:
+        that: rke2_token is defined and rke2_token | length >= 32
+        fail_msg: "rke2_token not loaded - check SOPS_AGE_KEY_FILE and community.sops"
+        quiet: true
+
+    - name: RKE2 agent is installed at the pinned version
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          curl -sfL --ipv4 https://get.rke2.io | \
+            INSTALL_RKE2_VERSION="{{ rke2_version }}" \
+            INSTALL_RKE2_TYPE="agent" sh -
+        executable: /bin/bash
+      args:
+        creates: /usr/local/lib/systemd/system/rke2-agent.service
+
+    - name: CIS sysctl profile is in place
+      ansible.builtin.copy:
+        src: /usr/share/rke2/rke2-cis-sysctl.conf
+        dest: /etc/sysctl.d/60-rke2-cis.conf
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload sysctl
+
+    - name: Apply sysctls now, before the service starts
+      ansible.builtin.meta: flush_handlers
+
+    - name: Configuration directory exists
+      ansible.builtin.file:
+        path: /etc/rancher/rke2
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: config.yaml is rendered
+      ansible.builtin.template:
+        src: config-agent.yaml.j2
+        dest: /etc/rancher/rke2/config.yaml
+        owner: root
+        group: root
+        mode: "0600"
+      notify: Restart rke2-agent
+
+    - name: rke2-agent is enabled and running
+      ansible.builtin.systemd:
+        name: rke2-agent
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Wait for this node to report Ready
+      # Queried from a server: agents have no kubeconfig of their own.
+      ansible.builtin.command:
+        cmd: >
+          /var/lib/rancher/rke2/bin/kubectl
+          --kubeconfig /etc/rancher/rke2/rke2.yaml
+          get node {{ rke2_node_name }}
+          -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      delegate_to: "{{ rke2_bootstrap_host }}"
+      register: node_ready
+      until: node_ready.stdout == "True"
+      retries: 60
+      delay: 10
+      changed_when: false
+      check_mode: false
+
+  handlers:
+    - name: Reload sysctl
+      ansible.builtin.systemd:
+        name: systemd-sysctl
+        state: restarted
+
+    - name: Restart rke2-agent
+      ansible.builtin.systemd:
+        name: rke2-agent
+        state: restarted

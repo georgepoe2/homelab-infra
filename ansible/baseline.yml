@@ -1,0 +1,126 @@
+---
+# Pre-RKE2 node baseline.
+#
+# Most node configuration already lives in the golden image. This playbook does
+# two things: it ASSERTS that the image's promises survived cloning, and it
+# applies the per-node preparation that depends on the CNI choice (ADR-002:
+# Cilium), which the template could not know about when it was built.
+- name: Baseline for RKE2 nodes
+  hosts: rke2_servers:rke2_agents
+  become: true
+  gather_facts: true
+
+  tasks:
+
+    # ---- Verify the golden image, before building anything on top of it ----
+
+    - name: Gather service state
+      ansible.builtin.service_facts:
+
+    - name: SELinux is enforcing
+      ansible.builtin.assert:
+        that:
+          - ansible_selinux.status == "enabled"
+          - ansible_selinux.config_mode == "enforcing"
+        fail_msg: "SELinux is not enforcing - RKE2's SELinux policy expects it"
+
+    - name: Swap is off
+      ansible.builtin.assert:
+        that: ansible_swaptotal_mb == 0
+        fail_msg: "Swap is present - the kubelet refuses to start with swap enabled"
+
+    - name: firewalld is not running
+      ansible.builtin.assert:
+        that: >
+          'firewalld.service' not in services
+          or services['firewalld.service'].state != 'running'
+        fail_msg: "firewalld is running - it conflicts with the CNI's iptables/eBPF rules"
+
+    - name: Kernel is new enough for Cilium kube-proxy replacement
+      ansible.builtin.assert:
+        that: ansible_kernel is version('5.8', '>=')
+        fail_msg: "Kernel {{ ansible_kernel }} is below 5.8; do not enable kubeProxyReplacement"
+
+    - name: Count the nameservers in /etc/resolv.conf
+      ansible.builtin.command:
+        cmd: grep -c '^nameserver' /etc/resolv.conf
+      register: ns_count
+      changed_when: false
+      failed_when: false
+      # Read-only, so it must still run under --check; without this Ansible
+      # skips it and the assertion below reads an undefined variable.
+      check_mode: false
+
+    - name: Exactly one nameserver, and it is the internal one
+      ansible.builtin.assert:
+        that: ns_count.stdout | int == 1
+        fail_msg: >
+          {{ ns_count.stdout }} nameservers in /etc/resolv.conf. The gateway
+          returns NODATA for internal names and glibc may treat that as final.
+
+    # ---- The nodes are IPv4-only; say so once ----
+
+    # rpm.rancher.io resolves to both A and AAAA records. These VMs have no
+    # global IPv6 address, so when librepo happened to pick the AAAA it failed
+    # with "No route to host" - a real routing error for a destination dnf
+    # should never have tried. Which address family it picks is not stable, so
+    # the same install succeeded on the control planes and failed on a worker.
+    # glibc's built-in RFC 3484 table ranks native IPv6 (40) above
+    # IPv4-mapped (10), so anything using getaddrinfo - curl, dnf, librepo,
+    # python - prefers a AAAA even on a host with no global IPv6 address.
+    # Raising the IPv4 precedence flips that for every program at once,
+    # rather than patching each caller as it fails.
+    - name: glibc prefers IPv4
+      ansible.builtin.lineinfile:
+        path: /etc/gai.conf
+        regexp: '^precedence ::ffff:0:0/96'
+        line: 'precedence ::ffff:0:0/96  100'
+        create: true
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: dnf resolves IPv4 only
+      ansible.builtin.lineinfile:
+        path: /etc/dnf/dnf.conf
+        insertafter: '^\[main\]'
+        regexp: '^ip_resolve='
+        line: 'ip_resolve=4'
+        owner: root
+        group: root
+        mode: "0644"
+
+    # Every problem on this build so far has turned out to be DNS. Not having
+    # dig on the machines has cost more than the 2MB the package weighs.
+    - name: DNS tools are available for diagnosis
+      ansible.builtin.dnf:
+        name: bind-utils
+        state: present
+
+    # ---- CNI-dependent preparation: Cilium ----
+
+    - name: NetworkManager leaves Cilium's interfaces alone
+      ansible.builtin.copy:
+        dest: /etc/NetworkManager/conf.d/rke2-cilium.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Cilium creates and owns these. NetworkManager managing them causes
+          # intermittent pod networking failures that look like anything else.
+          # RKE2 documents this for Canal only; the Cilium equivalent is ours.
+          [keyfile]
+          unmanaged-devices=interface-name:cilium_*;interface-name:lxc*;interface-name:cilium_host;interface-name:cilium_net;interface-name:cilium_vxlan;interface-name:cilium_geneve;interface-name:cilium_wg0
+      notify: Reload NetworkManager
+
+    - name: The Canal NetworkManager exclusion is not needed with Cilium
+      ansible.builtin.file:
+        path: /etc/NetworkManager/conf.d/rke2-canal.conf
+        state: absent
+      notify: Reload NetworkManager
+
+  handlers:
+    - name: Reload NetworkManager
+      ansible.builtin.systemd:
+        name: NetworkManager
+        state: reloaded

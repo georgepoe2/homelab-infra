@@ -1,0 +1,4 @@
+---
+collections:
+  # Decrypts group_vars/**/*.sops.yml transparently via its vars plugin.
+  - name: community.sops

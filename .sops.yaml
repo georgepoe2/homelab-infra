@@ -1,0 +1,4 @@
+creation_rules:
+  # Ansible group/host vars: encrypt every value, not just data/stringData.
+  - path_regex: ansible/(group_vars|host_vars)/.*\.sops\.ya?ml$
+    age: age1kr0vn2a7n42xpneeqfc7jsxngwmvr6gh7uyse80904kgldqzlersnwc5s4
