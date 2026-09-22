@@ -22,7 +22,7 @@ Built in phases. This is honest about where it is.
 | 3 — Rocky 9 golden image | ✅ Complete |
 | 4 — State store, repos, secrets | ✅ Complete |
 | 5 — Provisioning with OpenTofu | ✅ Complete |
-| 6 — RKE2 cluster | 🚧 Cluster up; HA drill outstanding |
+| 6 — RKE2 cluster | ✅ Complete — failover measured at ~10 s |
 | 7 — Flux and the platform layer | ⬜ Not started |
 | 8 — Operate: restore, rebuild, upgrade | ⬜ Not started |
 
@@ -370,6 +370,28 @@ A non-deterministic failure that a retry appears to fix is worse than a
 consistent one. Fixed at the source with `precedence ::ffff:0:0/96 100` in
 `/etc/gai.conf`, which applies to every program on the node, rather than adding
 `--ipv4` to each caller as it fails.
+### The deliberate failover drill
+
+After the involuntary version, the planned one. The control plane holding the
+kube-vip lease (`k8s-cp-3`) was hard-stopped with `qm stop` — no graceful
+shutdown, no chance to release the lease — while a loop polled the API through
+the VIP once a second:
+
+```
+10:14:29 401          <- last answer from cp-3
+10:14:30 TIMEOUT
+10:14:33 TIMEOUT      lease still reads cp-3 until 10:14:36:
+10:14:36 TIMEOUT      a dead holder's lease is not cleared, it expires
+10:14:39 401          <- cp-2 took the lease at 10:14:38
+```
+
+**About ten seconds** from power-off to the API answering through the VIP,
+inside what the 5 s lease duration predicts. etcd held quorum at two of three
+throughout (`context deadline exceeded` on the dead member only), and the node
+rejoined on restart with no manual steps.
+
+(`401` is the healthy answer here: the CIS profile disables anonymous auth, so
+an unauthenticated `/healthz` is refused rather than served.)
 ---
 
 ## Repository layout
@@ -404,7 +426,6 @@ it rather than assumed to work.
 
 ## Roadmap
 
-- Phase 6 — HA failure drill (cluster itself is up; see [ADR-002](docs/adr/002-cilium-as-cni.md))
 - Phase 7 — Flux, MetalLB, ingress-nginx, cert-manager, NFS CSI
 - Phase 8 — restore an etcd snapshot, destroy and rebuild the whole cluster
   twice, drive a minor-version upgrade with zero dropped requests
