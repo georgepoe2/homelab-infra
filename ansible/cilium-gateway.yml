@@ -1,0 +1,160 @@
+---
+# Enable Cilium's Gateway API and L2 announcements (ADR-003).
+#
+# Order matters and is the whole point of this playbook being separate:
+# the Gateway API CRDs must exist BEFORE the Cilium operator restarts with
+# gatewayAPI.enabled=true. An operator that cannot start never registers the
+# Cilium CRDs, every agent blocks waiting for them, and the cluster loses its
+# CNI - the exact failure seen during the Phase 6 bootstrap.
+#
+#     ansible-playbook cilium-gateway.yml
+#
+- name: Cilium Gateway API and L2 announcements
+  hosts: rke2_servers
+  become: true
+  gather_facts: true
+
+  vars:
+    kubectl: /var/lib/rancher/rke2/bin/kubectl --kubeconfig /etc/rancher/rke2/rke2.yaml
+    # Six come from the standard channel. TLSRoute does NOT: at v1.4.1 it is
+    # still an experimental resource served at v1alpha2. It was promoted to
+    # standard at v1 in Gateway API v1.5.0 - which is the very change that
+    # breaks Cilium 1.19's field indexer. Cilium's own docs list it under
+    # standard/ because they are written for Gateway API v1.6.1 / Cilium 1.20.
+    gw_crds:
+      - { channel: standard,     file: gateway.networking.k8s.io_gatewayclasses.yaml }
+      - { channel: standard,     file: gateway.networking.k8s.io_gateways.yaml }
+      - { channel: standard,     file: gateway.networking.k8s.io_httproutes.yaml }
+      - { channel: standard,     file: gateway.networking.k8s.io_referencegrants.yaml }
+      - { channel: standard,     file: gateway.networking.k8s.io_grpcroutes.yaml }
+      - { channel: standard,     file: gateway.networking.k8s.io_backendtlspolicies.yaml }
+      - { channel: experimental, file: gateway.networking.k8s.io_tlsroutes.yaml }
+
+  tasks:
+
+    # ---- 1. CRDs, once, from the bootstrap node ----
+
+    - name: Install the Gateway API CRDs at the version Cilium 1.19 supports
+      ansible.builtin.command:
+        cmd: >
+          {{ kubectl }} apply --server-side -f
+          https://raw.githubusercontent.com/kubernetes-sigs/gateway-api/{{ gateway_api_version }}/config/crd/{{ item.channel }}/{{ item.file }}
+      loop: "{{ gw_crds }}"
+      loop_control:
+        label: "{{ item.channel }}/{{ item.file }}"
+      run_once: true
+      delegate_to: "{{ rke2_bootstrap_host }}"
+      # A server-side apply is declarative; whether it reports "configured" or
+      # "unchanged" is not worth a conditional inside a loop.
+      changed_when: false
+
+    - name: Confirm the CRDs are established before touching Cilium
+      ansible.builtin.command:
+        cmd: >
+          {{ kubectl }} wait --for=condition=Established --timeout=120s
+          crd/gatewayclasses.gateway.networking.k8s.io
+          crd/gateways.gateway.networking.k8s.io
+          crd/httproutes.gateway.networking.k8s.io
+          crd/tlsroutes.gateway.networking.k8s.io
+      run_once: true
+      delegate_to: "{{ rke2_bootstrap_host }}"
+      changed_when: false
+      check_mode: false
+
+    # A CRD at the wrong version is worse than none: the operator starts,
+    # fails its field indexer, and stops. Assert the served version rather
+    # than trusting the apply.
+    - name: TLSRoute is served at v1alpha2, as Cilium 1.19 expects
+      ansible.builtin.shell:
+        cmd: >
+          {{ kubectl }} get crd tlsroutes.gateway.networking.k8s.io
+          -o jsonpath='{.spec.versions[*].name}'
+      run_once: true
+      delegate_to: "{{ rke2_bootstrap_host }}"
+      register: tlsroute_versions
+      changed_when: false
+      check_mode: false
+
+    - name: Fail loudly if the CRD version pairing is wrong
+      ansible.builtin.assert:
+        that: "'v1alpha2' in tlsroute_versions.stdout"
+        fail_msg: >
+          TLSRoute does not serve v1alpha2 (got: {{ tlsroute_versions.stdout }}).
+          Gateway API is newer than {{ gateway_api_version }}. Cilium 1.19's
+          operator will not start. Do not continue - see ADR-003.
+        success_msg: "Gateway API {{ gateway_api_version }} pairs with Cilium 1.19"
+      run_once: true
+
+    # ---- 2. Only now, the Cilium values ----
+
+    - name: Cilium HelmChartConfig has Gateway API and L2 announcements
+      ansible.builtin.template:
+        src: rke2-cilium-config.yaml.j2
+        dest: /var/lib/rancher/rke2/server/manifests/rke2-cilium-config.yaml
+        owner: root
+        group: root
+        mode: "0600"
+      register: cilium_cfg
+
+    # ---- 3. Roll the pods, because nothing else will ----
+
+    # RKE2's rke2-cilium chart puts no config checksum on the pod template, so
+    # a values-only change updates the cilium-config ConfigMap and leaves every
+    # pod running with its old flags in memory. The chart creates the
+    # GatewayClass, but the un-restarted operator never reconciles it, so it
+    # sits at ACCEPTED=Unknown and looks like a Gateway API failure.
+    #
+    # Only restart when the config actually changed - this play should be
+    # re-runnable without cycling the CNI every time.
+    - name: Restart the Cilium operator so it picks up Gateway API
+      ansible.builtin.command:
+        cmd: "{{ kubectl }} -n kube-system rollout restart deployment/cilium-operator"
+      run_once: true
+      delegate_to: "{{ rke2_bootstrap_host }}"
+      when: hostvars[rke2_bootstrap_host].cilium_cfg is changed
+
+    - name: Wait for the operator rollout to complete
+      ansible.builtin.command:
+        cmd: >
+          {{ kubectl }} -n kube-system rollout status deployment/cilium-operator
+          --timeout=300s
+      run_once: true
+      delegate_to: "{{ rke2_bootstrap_host }}"
+      when: hostvars[rke2_bootstrap_host].cilium_cfg is changed
+      changed_when: false
+      check_mode: false
+
+    # enable-l2-announcements is read by the agent at startup, so the DaemonSet
+    # needs the same treatment. Safe on a live cluster: the datapath is eBPF in
+    # the kernel and survives the agent restarting.
+    - name: Restart the Cilium agents so they pick up L2 announcements
+      ansible.builtin.command:
+        cmd: "{{ kubectl }} -n kube-system rollout restart daemonset/cilium"
+      run_once: true
+      delegate_to: "{{ rke2_bootstrap_host }}"
+      when: hostvars[rke2_bootstrap_host].cilium_cfg is changed
+
+    - name: Wait for the agent rollout to complete
+      ansible.builtin.command:
+        cmd: >
+          {{ kubectl }} -n kube-system rollout status daemonset/cilium
+          --timeout=900s
+      run_once: true
+      delegate_to: "{{ rke2_bootstrap_host }}"
+      when: hostvars[rke2_bootstrap_host].cilium_cfg is changed
+      changed_when: false
+      check_mode: false
+
+    - name: GatewayClass 'cilium' is accepted
+      ansible.builtin.shell:
+        cmd: >
+          {{ kubectl }} get gatewayclass cilium
+          -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}'
+      run_once: true
+      delegate_to: "{{ rke2_bootstrap_host }}"
+      register: gwclass
+      until: gwclass.stdout == "True"
+      retries: 30
+      delay: 10
+      changed_when: false
+      check_mode: false

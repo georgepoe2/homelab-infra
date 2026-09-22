@@ -18,6 +18,23 @@ spec:
       enabled: true
       relay:
         enabled: true
+
+    # ADR-003. Gateway API replaces ingress-nginx, which retired in March 2026.
+    # The CRDs (v1.4.1) MUST already be installed before the operator restarts
+    # with this enabled, or it fails to start and takes the CNI with it.
+    gatewayAPI:
+      enabled: true
+    # Required by Gateway API; on by default, stated here so it is not lost.
+    l7Proxy: true
+
+    # ADR-003. Cilium allocates LoadBalancer IPs and announces them on the LAN,
+    # in place of MetalLB. One less component, and one less Pod Security
+    # exemption under the CIS profile.
+    l2announcements:
+      enabled: true
+    k8sClientRateLimit:
+      qps: {{ cilium_k8s_client_qps }}
+      burst: {{ cilium_k8s_client_burst }}
 {% if rke2_taint_control_plane %}
     # RKE2's packaged Cilium chart tolerates every taint EXCEPT
     # CriticalAddonsOnly - the one RKE2's own hardening guidance tells you to

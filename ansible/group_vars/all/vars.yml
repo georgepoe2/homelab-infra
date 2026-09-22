@@ -10,6 +10,19 @@ rke2_version: "v1.36.4+rke2r1"
 # restarted - which would invalidate the control-plane failure drill in 6.4.
 kube_vip_version: "v1.2.4"
 
+# ADR-003. Cilium 1.19.6 supports Gateway API v1.4.1. v1.5.0+ promoted TLSRoute
+# from v1alpha2 to v1, which Cilium >=1.19.2 <1.20.0 cannot index - its operator
+# refuses to start, and an operator that will not start means no CNI at all.
+# Re-check this pairing before any Cilium upgrade.
+gateway_api_version: "v1.4.1"
+
+# L2 announcements hold a lease per announced service and renew continuously.
+# Cilium's default is 5 QPS / 10 burst, which its docs say is "quickly reached".
+# Sized by QPS = #services * (1 / leaseRenewDeadline); generous for a handful
+# of services, and cheap.
+cilium_k8s_client_qps: 10
+cilium_k8s_client_burst: 25
+
 # ---- Cluster identity (permanent after first boot) ---------------------
 rke2_bootstrap_host: "k8s-cp-1"
 rke2_vip: "192.168.1.201"
