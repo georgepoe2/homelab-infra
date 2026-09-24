@@ -1,8 +1,9 @@
 # Restore and Recovery
 
-Written to be read under stress, on a machine that may not be the one that
-built this. Every procedure assumes you have nothing but a browser, a
-terminal, and access to your password manager.
+Writing the restore document following the 3 am rule. If I can't follow it at 3 am after being shocked awake by a phone call asking me to fix something it's too complicated.
+
+Every procedure assumes you have a browser, a terminal, and access to your password manager.
+
 
 **Conventions in this document**
 
