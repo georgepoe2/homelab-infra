@@ -1,8 +1,14 @@
-# Rookery — a homelab Kubernetes platform, built from code
+# Rookery: homelab Kubernetes platform, built systematically.
 
-Three Proxmox nodes and a Synology NAS, running a three-node HA RKE2 cluster
-provisioned entirely from version control. Everything the cluster depends on
-to be rebuilt lives outside the cluster, on purpose.
+Attempting to improve my knowledge and understanding of K8s. Pulled together a Homelab made from three mini-PCs, an old M1 Mac mini we've used as a personal computer for years, and the Synology NAS I've been using for home storage for several years.
+
+Most of the basic setup was chosen from YouTube research and Claude AI recommendations to get me to a point where I could learn to deploy, manage, and troubleshoot containers in the environment.
+
+This ended up being Proxmox on the miniPCs, the Mac acting as my workstation, and Several infrastructure pieces running in Container Manager on the NAS.
+
+I utilized Claude to write the documentation and first drafts of most of the configurations. I chose the hardware and the tools, ran everything, and did the debugging including catching several of Claude's mistakes sometimes repetitively. He really likes putting ! Inside double quotes. Every measurement and error message in here came off my command outputs.
+
+---
 
 This repository holds the infrastructure layer: OpenTofu, Ansible, and the
 decision records. The cluster's contents live in
