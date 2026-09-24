@@ -98,3 +98,70 @@ later, during node bootstrap, when that toleration is the one that matters.
 - `KubeProxyReplacement: True [eth0 ... (Direct Routing)]`
 - No kube-proxy container on any node
 - `cilium status --brief` → `OK` across all eight nodes
+
+## The obligation, discharged — 24 September 2026
+
+This ADR said: *"if Phase 7 ships without network policies, the security
+argument for this decision is hollow."* Here is the discharge.
+
+A `CiliumNetworkPolicy` default-denying the `demo` namespace was committed with
+no allow rule. Hubble, watching the same traffic that had been returning 200 a
+minute earlier:
+
+```
+20:46:37  10.42.6.130:51320 (ingress) <> demo/whoami-...nm445:8080
+          policy-verdict:none DENIED (TCP Flags: SYN)
+20:46:37  ... Policy denied DROPPED (TCP Flags: SYN)
+20:46:38  ... Policy denied DROPPED (TCP Flags: SYN)     <- retransmits
+20:46:39  ... Policy denied DROPPED (TCP Flags: SYN)
+```
+
+Six SYNs over three seconds, none answered. Then a second commit adding one
+narrow allow — `fromEntities: [ingress]`, port 8080 only:
+
+```
+20:47:36  10.42.6.130:49674 (ingress) -> demo/whoami-...nm445:8080
+          policy-verdict:none ALLOWED (TCP Flags: SYN)
+20:47:36  ... to-endpoint FORWARDED
+20:47:36  192.168.1.155:52129 (ingress) -> ... http-request FORWARDED
+          (HTTP/1.1 GET http://whoami.rookery.internal/)
+20:47:36  ... http-response FORWARDED (HTTP/1.1 200 2ms)
+```
+
+Same source identity, same pod, same port, sixty seconds apart. The only
+change was a git commit.
+
+### Why this is the identity argument and not the IP argument
+
+The denied source is `10.42.6.130`, which Hubble resolves to the reserved
+`ingress` identity — Cilium's own Gateway API Envoy proxy. That address is a
+pod IP on whichever worker currently answers ARP for `192.168.1.235`. A
+CIDR-based policy would have had to name it, and would break the next time the
+L2 lease moved or the agent restarted. `fromEntities: [ingress]` does not care.
+
+That is the whole of "more enforceable" in one observation.
+
+### Three attempts at expressing default-deny
+
+Worth recording, because two of them were wrong in ways that would not have
+been obvious:
+
+1. **`ingress: [{}]`** — an empty rule. In Kubernetes `NetworkPolicy` an empty
+   rule means *allow from anywhere*, and Cilium's own schema says an empty
+   member "has no effect on the rule". A policy that looks restrictive and is
+   not is worse than no policy, because it would have been cited as evidence.
+2. **`enableDefaultDeny` with no rules** — rejected by the CRD's OpenAPI
+   validation: `"spec" must validate at least one schema (anyOf),
+   spec.ingress: Required value`. A policy must carry rules to be valid, so
+   the flag cannot stand alone.
+3. **Rules selecting the `none` entity** — what shipped. The entity list, read
+   off the cluster with `kubectl explain`, is world, cluster, host,
+   remote-node, kube-apiserver, ingress, init, health, unmanaged, none, all.
+   `none` matches nothing, so the rule's presence enables enforcement while
+   permitting no traffic.
+
+Attempt 2 was caught by **Flux's server-side dry-run**, which refused the whole
+revision rather than applying part of it. The `apps` Kustomization stayed on its
+last good revision and the running Deployment was never touched — a broken
+commit halted progress instead of degrading the cluster. That is the opposite
+of this build's recurring failure mode, and worth noting as such.
