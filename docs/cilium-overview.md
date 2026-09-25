@@ -97,7 +97,8 @@ Someone on the LAN opens `grafana.rookery.internal`:
      │ 1. who is grafana.rookery.internal?
      v
   AdGuard Home  (192.168.1.250)
-     │             wildcard *.rookery.internal -> 192.168.1.235
+     │             explicit rewrite -> 192.168.1.235
+     │             (no wildcard: it swallowed every external name too)
      │ 2. "192.168.1.235"
      v
   Browser: who has 192.168.1.235?   -- ARP broadcast on the LAN --+
@@ -135,7 +136,7 @@ kernel program in constant time.
 | Concern | Owner | Why not Cilium |
 |---|---|---|
 | Control-plane VIP `.201` | **kube-vip** | Must work before the cluster exists. Cilium needs a running API server; kube-vip is what makes the API server reachable. kube-vip runs with `svc_enable: false` precisely so the two never both answer ARP for service IPs. |
-| DNS for `*.rookery.internal` | **AdGuard Home** on the NAS | Outside the cluster on purpose — Phase 8 destroys the cluster, and name resolution has to survive that. |
+| DNS for `rookery.internal` names | **AdGuard Home** on the NAS | Outside the cluster on purpose — Phase 8 destroys the cluster, and name resolution has to survive that. |
 | Certificates | **cert-manager** + the internal CA | Cilium terminates TLS; it does not issue the certificate. |
 | In-cluster DNS | **CoreDNS** | Cilium carries packets to it. |
 | Storage | **NFS CSI** to the Synology | Unrelated layer. |

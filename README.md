@@ -29,7 +29,7 @@ Built in phases. This is honest about where it is.
 | 4 — State store, repos, secrets | ✅ Complete |
 | 5 — Provisioning with OpenTofu | ✅ Complete |
 | 6 — RKE2 cluster | ✅ Complete — failover measured at ~10 s |
-| 7 — Flux and the platform layer | ⬜ Not started |
+| 7 — Flux and the platform layer | 🚧 In progress — GitOps, Gateway API and network policy live; cert-manager and CSI outstanding |
 | 8 — Operate: restore, rebuild, upgrade | ⬜ Not started |
 
 ---
@@ -59,7 +59,7 @@ Built in phases. This is honest about where it is.
                  └── 1× ops
                            │
                  kube-vip VIP  .201
-                 MetalLB pool  .235 → ingress-nginx
+                 Cilium LB-IPAM  .235 → Gateway API
 ```
 
 **Layers, and who owns what**
@@ -398,6 +398,38 @@ rejoined on restart with no manual steps.
 
 (`401` is the healthy answer here: the CIS profile disables anonymous auth, so
 an unauthenticated `/healthz` is refused rather than served.)
+### github.com resolved to my ingress VIP
+
+Flux bootstrapped, pushed its manifests, and then sat waiting for the
+in-cluster source-controller to clone the repo back. The log:
+
+```
+unable to clone 'ssh://git@github.com/georgepoe2/homelab-fleet':
+dial tcp 192.168.1.235:22: connect: no route to host
+```
+
+`192.168.1.235` is the ingress address. `github.com` had resolved to it.
+
+Pods get `options ndots:5` and a search list ending in `rookery.internal`.
+`github.com` has one dot, fewer than five, so the resolver tried every search
+suffix first — including `github.com.rookery.internal`. AdGuard's wildcard
+`*.rookery.internal -> 192.168.1.235` answered, the resolver took the first
+answer it got, and dialled the ingress VIP on port 22.
+
+So from inside the cluster, **every external hostname with fewer than five dots
+resolved to the ingress address**. Not just GitHub — every image registry,
+every API. Flux was simply the first workload to try reaching the outside
+world.
+
+Fixed by deleting the wildcard. Each application now gets its own rewrite,
+which is a few seconds per app. The alternatives — scoping the wildcard to a
+subdomain, or pointing kubelet at a resolv.conf without the search domain —
+both leave a zone that answers for every name under it, and it will end up in
+someone's search path again.
+
+I had flagged this wildcard four days earlier, when it made every node name
+resolve to the ingress LB. It was a footgun then. Once anything inside the
+cluster needed the internet it was a wall.
 ---
 
 ## Repository layout
@@ -432,7 +464,7 @@ it rather than assumed to work.
 
 ## Roadmap
 
-- Phase 7 — Flux, MetalLB, ingress-nginx, cert-manager, NFS CSI
+- Phase 7 — Flux, Cilium LB-IPAM, Gateway API, cert-manager, NFS CSI
 - Phase 8 — restore an etcd snapshot, destroy and rebuild the whole cluster
   twice, drive a minor-version upgrade with zero dropped requests
 
