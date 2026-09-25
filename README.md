@@ -30,7 +30,7 @@ Built in phases. This is honest about where it is.
 | 5 — Provisioning with OpenTofu | ✅ Complete |
 | 6 — RKE2 cluster | ✅ Complete — failover measured at ~10 s |
 | 7 — Flux and the platform layer | 🚧 In progress — GitOps, Gateway API and network policy live; cert-manager and CSI outstanding |
-| 8 — Operate: restore, rebuild, upgrade | ⬜ Not started |
+| 8 — Operate: restore, rebuild, upgrade | 🚧 In progress — etcd snapshot restore drilled end to end; rebuild and upgrade outstanding |
 
 ---
 
@@ -430,6 +430,79 @@ someone's search path again.
 I had flagged this wildcard four days earlier, when it made every node name
 resolve to the ingress LB. It was a footgun then. Once anything inside the
 cluster needed the internet it was a wall.
+
+### Stopping the service did not stop the cluster
+
+Symptom: all three `rke2-server` services reported `inactive`, and `kubectl`
+from my laptop kept answering.
+
+`systemctl stop rke2-server` stops the supervisor and the kubelet. It does not
+stop the static pods. Those run as containerd shim children that get reparented
+to PID 1, so etcd, kube-apiserver and kube-controller-manager stayed up with
+uptimes from the day the node was built:
+
+```
+etcd  2351  Sep18  etcd --config-file=/var/lib/rancher/rke2/server/db/etcd/config
+root  5205  Sep18  kube-apiserver --advertise-address=192.168.1.221 ...
+```
+
+That matters, because `rke2 server --cluster-reset` wants sole use of the etcd
+data directory and ports 2379/2380. Running it with the old etcd still holding
+them puts two processes on one database.
+
+**Fix:** `rke2-killall.sh` is the real stop. On an RPM install it lives in
+`/usr/bin`, not `/usr/local/bin`, and `rke2-uninstall.sh` sits beside it one
+tab-completion away. `rpm -ql rke2-common` is how to find them rather than
+guessing.
+
+I only caught this because the API kept answering after I thought I'd stopped
+everything, and that looked wrong. Trusting `systemctl` would have meant
+running the reset into a live database.
+
+### An address left behind reported itself as an etcd failure
+
+After the restore, cp-2 refused to rejoin:
+
+```
+Error: preparing server: failed to bootstrap cluster data:
+Get "https://192.168.1.201:9345/v1-rke2/server-bootstrap":
+dial tcp 192.168.1.201:9345: connect: connection refused
+```
+
+The message blames cluster data. The fault was a leftover IP address.
+
+kube-vip assigns the VIP by adding it to `eth0` on whichever server holds the
+lease, and `rke2-killall.sh` kills the pod without removing the address. cp-2
+had been the holder, so `192.168.1.201/32` was still on its own NIC:
+
+```
+cp-2   eth0   192.168.1.222/24  192.168.1.201/32    <- orphan, nothing listening
+cp-1   eth0   192.168.1.221/24  192.168.1.201/32    <- live, rke2 on 9345
+```
+
+Refused rather than timed out, because cp-2's request to the VIP never left the
+box. One command cleared it:
+
+```
+ip addr del 192.168.1.201/32 dev eth0
+```
+
+**Fix in the runbook:** after killall, run `ip -4 -br addr show` on every server
+and delete the VIP anywhere other than the node you are restoring from. Only the
+last lease holder carries it — cp-3 was clean.
+
+### A restored cluster shows you the past and calls it the present
+
+With cp-1 back up alone, `kubectl get nodes` listed cp-2 and cp-3 as `Ready`.
+Both were powered down with their containers killed. Node conditions are rows in
+etcd like anything else, so the snapshot restored their 09:36 state along with
+everything else, and the node-lifecycle controller needed a heartbeat timeout to
+notice. The kube-vip pods read `Running` on all three nodes for the same reason.
+
+Anything that reads status straight after a restore is reading history. The
+90-second wait before believing `get nodes` is now a step in the runbook.
+
+
 ---
 
 ## Repository layout
@@ -460,13 +533,20 @@ CA private key. Both are held in three places, one of them offsite and
 passphrase-encrypted, and the offsite copy has been tested by decrypting from
 it rather than assumed to work.
 
+The restore was exercised rather than assumed on 25 September 2026. A marker
+object Flux does not manage was planted, snapshotted to the NAS, deleted from a
+live API, and came back from `--cluster-reset` with its original UID and
+resourceVersion — which is what proves etcd was restored and not that GitOps
+re-applied something. Eighteen minutes end to end, about three of them with no
+API at all. What it turned up is in *What broke*, above.
+
 ---
 
 ## Roadmap
 
 - Phase 7 — Flux, Cilium LB-IPAM, Gateway API, cert-manager, NFS CSI
-- Phase 8 — restore an etcd snapshot, destroy and rebuild the whole cluster
-  twice, drive a minor-version upgrade with zero dropped requests
+- Phase 8 — destroy and rebuild the whole cluster twice, drive a minor-version
+  upgrade with zero dropped requests (etcd snapshot restore: done 25 Sep 2026)
 
 Later: Packer for the golden image, step-ca replacing the static CA,
 blackbox_exporter replacing the certificate monitor script.

@@ -48,15 +48,8 @@ mkdir -p ~/rookery-ca && cd ~/rookery-ca
 Download `age.agekey.age` from Dropbox (folder `rookery-backups`), then:
 
 ```bash
-echo "Paste the Dropbox backup passphrase, then press Enter:"
-read -rs PASSPHRASE
-echo
-
-printf '%s' "$PASSPHRASE" | age -d -i - ~/Downloads/age.agekey.age > age.agekey 2>/dev/null \
-  || age -d ~/Downloads/age.agekey.age > age.agekey   # falls back to an interactive prompt
-
+age -d ~/Downloads/age.agekey.age > age.agekey    # prompts for the passphrase
 chmod 600 age.agekey
-unset PASSPHRASE
 ```
 
 **Verify you recovered the correct key**, not merely a valid one:
@@ -178,8 +171,146 @@ the gateway is in allow-all mode.
 
 ## 6. Restore etcd from a snapshot
 
-*To be written in Phase 8, after the first successful restore drill. Do not
-write it from the documentation — write it from what you actually did.*
+Before restoring, confirm etcd is actually the problem — most etcd
+incidents are fixed by something cheaper than a restore.
+
+    kubectl -n kube-system exec etcd-k8s-cp-1.rookery.internal -- etcdctl \
+      --cacert /var/lib/rancher/rke2/server/tls/etcd/server-ca.crt \
+      --cert /var/lib/rancher/rke2/server/tls/etcd/server-client.crt \
+      --key /var/lib/rancher/rke2/server/tls/etcd/server-client.key \
+      alarm list
+
+    (same command, ending in:  endpoint status --cluster -w table)
+
+Empty alarm list, three members, matching raft indexes = etcd is fine and
+the problem is elsewhere.
+
+If the API is down and you can't exec:
+    sudo journalctl -u rke2-server --no-pager | grep -iE 'etcd|alarm|leader'
+
+NOT a restore:
+	etcdserver: request timed out / no leader     quorum lost; it recovers when
+	                                              members return
+	mvcc: database space exceeded / alarm:NOSPACE read-only; compact, defrag,
+	                                              disarm the alarm
+	apply entries took too long, leader flapping  disk latency, not data loss
+
+IS a restore:
+	alarm:CORRUPT / etcdserver: corrupt cluster
+	wal: crc mismatch or bbolt panic on all three members
+	Nothing is broken and something is simply gone — a deleted namespace, an
+	over-eager prune. No alert fires for this one. It is the most likely reason
+	you are reading this page.
+
+/healthz returns 401, not ok. CIS profile disables anonymous auth. A monitor
+that expects "ok" reports the cluster down when it's healthy, and keeps
+reporting 401 when it genuinely is down.
+
+Begin the restore:
+
+make sure it's still possible to ssh as rocky to all three control planes.
+
+in terminal (don't forget to double check the session has loaded all of the environment settings)
+	set -a; source ~/.config/homelab/env; set +a
+	ssh rocky@k8s-cp-1.rookery.internal
+	ssh rocky@k8s-cp-2.rookery.internal
+	ssh rocky@k8s-cp-3.rookery.internal
+
+locate the snapshots. On workstation:
+
+	set -a; source ~/.config/homelab/env; set +a
+	aws --profile rookery-rke2 s3 ls s3://etcd-snapshots/
+
+run through restore:
+run commands on cp-2 then cp-3 and lastly cp-1 so that failovers end up where we expect
+During testing attempted to stop the rke2 server with systemctl but found this didn't kill all the static pods. used /usr/bin/rke2-killall.sh instead to kill them fully. verify with ps -ef:
+
+	sudo systemctl is-active rke2-server
+	sudo /usr/bin/rke2-killall.sh
+	sudo ps -ef | grep -E 'kube-apiserver|etcd ' | grep -v grep
+
+I also hit an issue that killall orphans the VIP so double check the status of the VIP here:
+
+On the workstation loop through the cp's to verify where the VIP is showing up.
+
+	held=0
+	for h in k8s-cp-1 k8s-cp-2 k8s-cp-3; do
+	if ssh -n -o WarnWeakCrypto=no rocky@$h 'ip -4 -o addr show dev eth0' \
+	| grep -q '192.168.1.201'; then
+	echo "$h  VIP held"; held=$((held+1))
+	else
+	echo "$h  clear"
+	fi
+	done
+	echo "holders: $held"
+
+| When                                        | Expected                  | If it's wrong                                        |
+|---------------------------------------------|---------------------------|------------------------------------------------------|
+| After killall, before any server is started | **0**                     | Orphan. Delete it wherever it appears in "ip del" command |
+| After cp-1 is up, before starting the peers | **1**, and it must be cp-1 | More than one is a split VIP. Stop and look.         |
+| Normal running                              | **1**                     | 0 means kube-vip is not running anywhere.            |
+
+Per above, if any are orphaned delete them:
+
+	sudo ip addr del 192.168.1.201/32 dev eth0
+	ip -4 -br addr show eth0
+
+once they are down, kubectl should fail at this time from our workstation. via ssh go ahead with the restore on cp-1. remember to use tmux for this. a broken ssh session here would suck.
+
+	tmux new -s restore
+
+	sudo /usr/bin/rke2 server \
+	--cluster-reset \
+	--cluster-reset-restore-path=<snapshot filename only> \
+	2>&1 | tee /tmp/restore.log
+
+On cp-1:
+
+	sudo systemctl start rke2-server
+	sudo systemctl is-active rke2-server
+
+	sudo /var/lib/rancher/rke2/bin/kubectl \
+	--kubeconfig /etc/rancher/rke2/rke2.yaml get nodes
+	sudo /var/lib/rancher/rke2/bin/kubectl \
+	--kubeconfig /etc/rancher/rke2/rke2.yaml get ns restore-drill
+	sudo /var/lib/rancher/rke2/bin/kubectl \
+	--kubeconfig /etc/rancher/rke2/rke2.yaml -n restore-drill get cm drill -o yaml
+	(this last command should be replaced with a search for something we knew was lost and went through this whole endeavor to recover. restore-drill is the place holder I used in the testing)
+
+We want this to return cp-1 as ready and cp-2 and cp-3 as Not Ready. Due to the restore they will show their status from the snapshot for a minute or so. If all three show Ready here, give it a minute and check again to make sure it's a real issue and not just old data.
+
+If everything is good we restart cp-2:
+
+On cp-2 double check configuration is clean:
+	ip -4 -o addr show dev eth0 | grep 192.168.1.201
+	curl -sSk -o /dev/null -w 'cacerts %{http_code}\n' https://192.168.1.201:9345/cacerts
+
+Expect no output from the first and cacerts 200 from the second. Otherwise the restart we are doing next will result in flapping. Go back up to the orphans checks and verify we didn't overlook anything and make our way back here. If the above looks good continue on to restarting cp-2..
+
+	sudo mv /var/lib/rancher/rke2/server/db /var/lib/rancher/rke2/server/db-old
+	sudo systemctl start rke2-server
+
+Check health of cp-2 from cp-1:
+
+	sudo /var/lib/rancher/rke2/bin/kubectl \
+	--kubeconfig /etc/rancher/rke2/rke2.yaml get nodes
+
+Once cp-2 is healthy repeat the restart checks and procedures on cp-3.
+
+Once all three are back up test kubectl from workstation.
+
+On Workstation:
+
+	kubectl -n kube-system exec etcd-k8s-cp-1.rookery.internal -- etcdctl \
+	  --cacert /var/lib/rancher/rke2/server/tls/etcd/server-ca.crt \
+	  --cert /var/lib/rancher/rke2/server/tls/etcd/server-client.crt \
+	  --key /var/lib/rancher/rke2/server/tls/etcd/server-client.key \
+	  member list -w table
+
+	kubectl get pods -A | grep -vE 'Running|Completed'
+	flux get kustomizations
+
+Validate everything looks good and we should be done.
 
 ---
 
