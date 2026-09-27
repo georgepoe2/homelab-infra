@@ -30,7 +30,7 @@ Built in phases. This is honest about where it is.
 | 5 — Provisioning with OpenTofu | ✅ Complete |
 | 6 — RKE2 cluster | ✅ Complete — failover measured at ~10 s |
 | 7 — Flux and the platform layer | 🚧 In progress — GitOps, Gateway API and network policy live; cert-manager and CSI outstanding |
-| 8 — Operate: restore, rebuild, upgrade | 🚧 In progress — etcd snapshot restore drilled end to end; rebuild and upgrade outstanding |
+| 8 — Operate: restore, rebuild, upgrade | 🚧 In progress — etcd snapshot restore drilled end to end; unattended recovery from a hard power cut measured at three minutes; rebuild and upgrade outstanding |
 
 ---
 
@@ -502,6 +502,53 @@ notice. The kube-vip pods read `Running` on all three nodes for the same reason.
 Anything that reads status straight after a restore is reading history. The
 90-second wait before believing `get nodes` is now a step in the runbook.
 
+
+### A firmware update on the battery cut power to all three hosts in the same second
+
+The lab had just moved onto a portable power station as battery backup. The next
+morning the unit applied a firmware update and dropped every output while doing
+it. All three hypervisors lost power at the same instant:
+
+```
+pve-1   previous boot ended   Sun 2026-09-27 12:24:10 EDT
+pve-2   previous boot ended   Sun 2026-09-27 12:24:10 EDT
+pve-3   previous boot ended   Sun 2026-09-27 12:24:10 EDT
+```
+
+Identical to the second on three independent clocks, which rules out a bad
+outlet or one leg dropping. The device cut every output at once.
+
+**A power station that updates its own firmware is not a UPS.** It is a battery
+with an outage scheduler attached, and the outage arrives on a quiet afternoon
+when nothing is wrong and nobody is watching. That is worse than a real power
+cut, which at least announces itself.
+
+The design changed as a result. The lab runs on a conventional UPS — in the
+power path by design, no firmware in it — and the power station gets connected
+to the refrigerator by hand when an outage looks long. That also retires a trick
+I had planned, where a second UPS left on wall power acted as a mains-presence
+sensor so the battery's capacity could go to the fridge instead of the lab. The
+UPS carrying the lab is the sensor.
+
+**What the accident measured, which neither deliberate drill had.** Power
+returned at 13:30:58. By 13:34:08 all three hosts were quorate with all eight
+VMs running, and every node read Ready at the first check. Three minutes, with
+no manual step taken inside the cluster.
+
+- etcd replayed its write-ahead log on all three members. No `crc mismatch`, no
+  alarms, identical raft index across the cluster. Nothing was lost.
+- The eight VMs auto-started, which is the first real test of `on_boot`.
+- The NIC offload units held. pve-1 had been up 166 days, so that unit had never
+  survived a reboot — it was assumed to work, not verified, until this.
+- Flux was still on the same revision and the Gateway answered 200.
+
+Three etcd members losing power mid-write simultaneously is a harsher test than
+either drill I built on purpose. The failover drill left two members standing,
+and the restore drill stopped the cluster cleanly first.
+
+One number changed for an unrelated reason: snapshots went from about 30 MB to
+17.5 MB. That is the restore two days earlier rebuilding the database from a
+snapshot and defragmenting it on the way up, not data loss.
 
 ---
 
