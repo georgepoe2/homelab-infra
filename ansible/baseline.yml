@@ -124,3 +124,58 @@
       ansible.builtin.systemd:
         name: NetworkManager
         state: reloaded
+
+# status: needs-rewrite (Claude draft, 2026-10-19). Put comments in your own words before pushing.
+# ---- Storage clients: workers only ----
+#
+# Pods that use NAS storage only run on workers (control planes carry
+# CriticalAddonsOnly:NoExecute), so only workers need the NFS and iSCSI clients.
+- name: Storage clients on workers
+  hosts: rke2_agents
+  become: true
+  gather_facts: false
+  # One node at a time, like the agent play. Installing packages isn't the image
+  # pull that hung the NICs, but there's no reason to find out.
+  serial: 1
+
+  tasks:
+
+    - name: NFS and iSCSI client packages are installed
+      ansible.builtin.dnf:
+        name:
+          - nfs-utils
+          - iscsi-initiator-utils
+        state: present
+
+    # The initiator name is how the Synology knows which node is asking for a
+    # LUN. It must be unique per node. The package is already in the golden
+    # image, so a name generated there would be shared by every clone.
+    # Deriving it from the hostname makes it unique and keeps it the same
+    # across a rebuild, so any host rules on the NAS keep matching.
+    - name: iSCSI initiator name is derived from the hostname
+      ansible.builtin.copy:
+        dest: /etc/iscsi/initiatorname.iscsi
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          InitiatorName=iqn.2026-10.internal.rookery:{{ inventory_hostname }}
+      notify: Restart iscsid
+      # /etc/iscsi comes with the package, so under --check it doesn't exist yet.
+      ignore_errors: "{{ ansible_check_mode }}"
+
+    - name: iscsid is enabled and running
+      ansible.builtin.systemd:
+        name: iscsid
+        enabled: true
+        state: started
+      # Under --check the package above is not really installed, so the unit
+      # does not exist yet and this task would fail. That says nothing about
+      # the real run.
+      ignore_errors: "{{ ansible_check_mode }}"
+
+  handlers:
+    - name: Restart iscsid
+      ansible.builtin.systemd:
+        name: iscsid
+        state: restarted
