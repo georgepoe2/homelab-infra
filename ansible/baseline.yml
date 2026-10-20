@@ -130,7 +130,7 @@
 #
 # Pods that use NAS storage only run on workers (control planes carry
 # CriticalAddonsOnly:NoExecute), so only workers need the NFS and iSCSI clients.
-- name: Storage clients on workers
+- name: Storage and VPN prerequisites on workers
   hosts: rke2_agents
   become: true
   gather_facts: false
@@ -163,6 +163,32 @@
       notify: Restart iscsid
       # /etc/iscsi comes with the package, so under --check it doesn't exist yet.
       ignore_errors: "{{ ansible_check_mode }}"
+
+    # Gluetun (the VPN sidecar) needs /dev/net/tun. Rocky ships the tun module
+    # but doesn't load it until something asks the kernel for it, and a
+    # container can't load modules. Without this, Gluetun fails with
+    # "open /dev/net/tun: no such device".
+    - name: tun module loads at boot
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/tun.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          tun
+
+    - name: tun module is loaded now
+      ansible.builtin.command:
+        cmd: modprobe tun
+      changed_when: false
+
+    # Check the property, not the exit code above. Skipped in --check, where
+    # modprobe didn't run, so this would fail for no real reason.
+    - name: tun module is present in the running kernel
+      ansible.builtin.command:
+        cmd: grep -qw '^tun' /proc/modules
+      changed_when: false
+      when: not ansible_check_mode
 
     - name: iscsid is enabled and running
       ansible.builtin.systemd:
