@@ -125,7 +125,6 @@
         name: NetworkManager
         state: reloaded
 
-# status: needs-rewrite (Claude draft, 2026-10-19). Put comments in your own words before pushing.
 # ---- Storage clients: workers only ----
 #
 # Pods that use NAS storage only run on workers (control planes carry
@@ -199,6 +198,43 @@
       # does not exist yet and this task would fail. That says nothing about
       # the real run.
       ignore_errors: "{{ ansible_check_mode }}"
+
+    # At boot, iscsid logs in to every target it has a record for that is set to
+    # start automatically. After the 2026-10-25 outage that put four LUNs on the
+    # wrong workers: the Synology accepts one session per target, so the node
+    # that actually ran the pod was refused. With startup set to manual nothing
+    # logs in at boot, and the Synology CSI driver logs in on the node that needs
+    # the volume.
+
+    # New records (the driver creates them when it first attaches a LUN) take
+    # their startup mode from here. Only the uncommented line is matched.
+    - name: New iSCSI node records default to manual startup
+      ansible.builtin.lineinfile:
+        path: /etc/iscsi/iscsid.conf
+        regexp: '^node\.startup\s*='
+        line: node.startup = manual
+      ignore_errors: "{{ ansible_check_mode }}"
+
+    # Records that already exist keep their own copy of the setting, so the
+    # config file alone doesn't fix them. Read-only, so it also runs in --check.
+    - name: Count existing node records still set to start at boot
+      ansible.builtin.shell: iscsiadm -m node -o show 2>/dev/null | grep -c '^node.startup = automatic' || true
+      register: iscsi_auto_before
+      changed_when: false
+      check_mode: false
+
+    - name: Existing node records start manually
+      ansible.builtin.command:
+        cmd: iscsiadm -m node -o update -n node.startup -v manual
+      when: iscsi_auto_before.stdout | int > 0
+
+    # Check the property: no record on this node is left that would log in at boot.
+    - name: No node record is left set to start at boot
+      ansible.builtin.shell: iscsiadm -m node -o show 2>/dev/null | grep -c '^node.startup = automatic' || true
+      register: iscsi_auto_after
+      changed_when: false
+      failed_when: iscsi_auto_after.stdout | int != 0
+      when: not ansible_check_mode
 
   handlers:
     - name: Restart iscsid
